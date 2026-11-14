@@ -145,27 +145,13 @@ with tab1:
             
             with st.spinner("Planning and executing..."):
                 try:
-                    # Create plan
-                    plan = planner.plan(user_query)
+                    # Create a validated plan (column names and types are sent, never rows)
+                    plan = planner.plan(user_query, dm.get_dataset())
 
-                    # Fallback for missing 'steps' with Worker-compatible dicts
-                    if 'steps' not in plan or not plan['steps']:
-                        st.warning(
-                            "Planner did not generate explicit steps. Using analysis and visualization sections as fallback."
-                        )
-                        pseudo_steps = []
-                        for a in plan.get('analysis', []):
-                            pseudo_steps.append({"action": a, "params": {}})
-                        for v in plan.get('visualization', []):
-                            pseudo_steps.append({"action": v, "params": {}})
-                        plan['steps'] = pseudo_steps
-
-                    # Critique plan (optional)
-                    if hasattr(planner, 'critique'):
-                        critique = planner.critique(plan)
-                        plan["self_check"] = critique
-
-                    st.subheader("📋 Analysis Plan (with Self-Critique):")
+                    st.subheader("📋 Analysis Plan")
+                    if plan.get("fallback_reason"):
+                        st.warning(f"The model's plan was unusable ({plan['fallback_reason']}), "
+                                   "so a simple rule-based plan is used instead.")
                     st.json(plan)
 
                     # Execute plan safely

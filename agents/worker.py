@@ -72,7 +72,7 @@ class Worker:
                             continue
                     else:
                         # 🛑 Final fallback
-                        fallback_plan = self.planner._create_fallback_plan(user_query)
+                        fallback_plan = self.planner.rule_based_plan(user_query)
                         outputs["results"][action] = {
                             "success": False,
                             "error": error_msg,
@@ -86,8 +86,6 @@ class Worker:
     def _feedback_to_planner(self, plan, action, error_msg):
         """Ask planner to fix the plan if worker execution failed"""
         try:
-            critique = self.planner.critique(plan)
-            logger.info(f"Planner critique: {critique}")
             revised = self.planner.plan(f"Revise due to error: {error_msg}")
             return revised
         except Exception as e:
