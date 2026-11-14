@@ -5,6 +5,7 @@ import re
 from core.entropy_logger import EntropyLogger
 from core.executor import new_namespace, run_code, snapshot, user_variables
 from core.llm import LLMUnavailable, chat
+from core.safety import ALLOWED_MODULES
 from agents.planner import describe_dataset
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,7 @@ Current dataset:
 Rules:
 1. Put the main answer (a DataFrame, Series, number or short text) in a variable named `result`.
 2. For charts, just draw them with plt or sns. Do NOT call plt.show(), plt.savefig() or plt.close().
-3. Do not read or write files and do not use the network.
+3. Do not read or write files and do not use the network. You may only import: {", ".join(sorted(ALLOWED_MODULES))}.
 4. Never use inplace=True; assign instead, e.g. df["Age"] = df["Age"].fillna(df["Age"].median())
 5. Use only columns that exist.
 

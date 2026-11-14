@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from core.safety import SAFE_BUILTINS, check_code
+
 BASE_NAMES = {"df", "pd", "np", "plt", "sns", "__builtins__"}
 
 
@@ -36,7 +38,8 @@ class StepResult:
 
 def new_namespace(df: pd.DataFrame) -> dict:
     """One namespace shared by all steps of a plan, so step 2 sees step 1's changes."""
-    return {"df": df.copy(), "pd": pd, "np": np, "plt": plt, "sns": sns}
+    return {"df": df.copy(), "pd": pd, "np": np, "plt": plt, "sns": sns,
+            "__builtins__": SAFE_BUILTINS}   # open(), exec(), unsafe imports... don't exist here
 
 
 def user_variables(namespace: dict) -> dict:
@@ -72,6 +75,9 @@ def _describe_error(e: BaseException) -> str:
 
 def run_code(code: str, namespace: dict) -> StepResult:
     """Execute `code` in `namespace` (modified in place) and collect its outputs."""
+    problems = check_code(code)
+    if problems:   # refused before running: nothing executed, nothing changed
+        return StepResult(code, False, error="Blocked for safety: " + "; ".join(problems))
     plt.close("all")
     namespace.pop("result", None)          # never show a previous step's result by mistake
     stdout = io.StringIO()

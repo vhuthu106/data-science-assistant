@@ -3,5 +3,6 @@ pandas
 numpy
 matplotlib
 seaborn
+scipy
 openai
 python-dotenv
