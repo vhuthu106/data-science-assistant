@@ -1,54 +1,16 @@
-import os
 import json
-from dotenv import load_dotenv
-import requests
-from qwen_agent.agents import Assistant
-from qwen_agent.llm import get_chat_model
 import logging
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+from core.llm import chat
+
 logger = logging.getLogger(__name__)
 
 class Planner:
-    def __init__(self):
-        load_dotenv()
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        
-        # Initialize Qwen as fallback
-        llm_config = {
-            'model': 'qwen-turbo',
-            'model_server': 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-        }
-        llm = get_chat_model(llm_config)
-        self.qwen_agent = Assistant(llm=llm)
-        
-        self.use_openai = True if self.openai_api_key else False
-        self.fallback_used = False
-
     def plan(self, user_query: str):
-        if self.use_openai:
-            try:
-                return self._plan_with_openai(user_query)
-            except Exception as e:
-                if any(error_str in str(e).lower() for error_str in ["quota", "429", "rate", "insufficient_quota", "expecting value"]):
-                    logger.warning(f"OpenAI failed ({e}). Switching to Qwen...")
-                    self.use_openai = False
-                    self.fallback_used = True
-                    return self._plan_with_qwen(user_query)
-                else:
-                    logger.error(f"OpenAI error: {e} for prompt ; {user_query}")
-                    raise e
-        else:
-            return self._plan_with_qwen(user_query)
-    
-    def _plan_with_openai(self, user_query: str):
-        """Use OpenAI for planning"""
-        if not self.openai_api_key:
-            logger.warning("OpenAI API key not found. Using Qwen instead.")
-            self.use_openai = False
-            return self._plan_with_qwen(user_query)
-            
+        return self._request_plan(user_query)
+
+    def _request_plan(self, user_query: str):
+        """Use the LLM for planning"""
         prompt = f"""
 You are a planner agent for data science tasks. Convert the user request into a valid JSON plan with EXACTLY this structure:
 {{
@@ -69,35 +31,15 @@ User request: "{user_query}"
 Return ONLY the JSON object without any additional text, explanations, or code blocks.
 """
         
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.openai_api_key}"
-        }
-        
-        data = {
-            "model": "gpt-4.1-mini",
-            "messages": [
-                {"role": "system", "content": "You are a planning assistant that returns only valid JSON. No additional text."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0,
-            "max_tokens": 600
-        }
-        
         try:
-            response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
+            content = chat(
+                [
+                    {"role": "system", "content": "You are a planning assistant that returns only valid JSON. No additional text."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=600,
             )
-
-            if response.status_code != 200:
-                raise Exception(f"API error: {response.status_code} - {response.text}")
-
-            result = response.json()
-            content = result['choices'][0]['message']['content'].strip()
-            content = self._clean_json_response(content)
+            content = self._clean_json_response(content.strip())
 
             if not content or content.isspace():
                 raise Exception("Empty response from OpenAI")
@@ -126,8 +68,8 @@ Return ONLY the JSON object without any additional text, explanations, or code b
             logger.error(f"JSON decode error: {e}. Content: {content if 'content' in locals() else 'None'}")
             return self._create_fallback_plan(user_query)
         except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            raise e
+            logger.error(f"LLM API error: {e}")
+            raise
 
     def _clean_json_response(self, content):
         """Clean the response to extract pure JSON"""
@@ -149,46 +91,6 @@ Return ONLY the JSON object without any additional text, explanations, or code b
             content = content[:content.rfind('}') + 1]
         
         return content
-    
-    def _plan_with_qwen(self, user_query: str):
-        """Use Qwen as fallback for planning"""
-        prompt = f"""
-You are a planner agent for data science tasks. Convert the user request into a valid JSON plan with EXACTLY this structure:
-{{
-  "intent": "brief_description",
-  "steps": [
-    {{"action": "specific_action_name", "args": {{"query": "user_query_here"}}}}
-  ],
-  "tools": ["pandas", "matplotlib", "seaborn"]
-}}
-
-Available actions: create_plot, data_analysis, data_cleaning, correlation_analysis, group_analysis, statistical_test
-
-User request: "{user_query}"
-
-Return ONLY the JSON object without any additional text or explanations.
-"""
-        
-        try:
-            response = self.qwen_agent.run(prompt)
-            
-            if hasattr(response, 'content'):
-                content = response.content
-            elif isinstance(response, dict) and 'content' in response:
-                content = response['content']
-            else:
-                content = str(response)
-            
-            content = self._clean_json_response(content)
-            
-            if not content or content.isspace():
-                return self._create_fallback_plan(user_query)
-                
-            return json.loads(content)
-            
-        except Exception as e:
-            logger.error(f"Qwen planning failed: {e}")
-            return self._create_fallback_plan(user_query)
     
     def _create_fallback_plan(self, user_query: str):
         """Rule-based fallback planning"""
@@ -231,12 +133,6 @@ Return ONLY the JSON object without any additional text or explanations.
                 "tools": ["pandas", "matplotlib"]
             }
     
-    def get_planning_mode(self):
-        if self.use_openai:
-            return "OpenAI"
-        else:
-            return "Qwen (fallback)" if self.fallback_used else "Qwen"
-        
     def critique(self, plan: dict):
         """Ask the model to review its own plan and suggest improvements"""
         critique_prompt = f"""
@@ -251,11 +147,7 @@ Suggest improvements without changing the intent. Return JSON like:
 Plan: {json.dumps(plan, indent=2)}
 """
         try:
-            if self.use_openai:
-                response = self._plan_with_openai(critique_prompt)
-            else:
-                response = self._plan_with_qwen(critique_prompt)
-            return response
+            return self._request_plan(critique_prompt)
         except Exception as e:
             logger.error(f"Critique failed: {e}")
             return {"issues": ["Critique unavailable"], "improvements": [], "confidence": "low"}

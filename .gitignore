@@ -7,7 +7,6 @@ venv/
 # Secrets: NEVER commit API keys
 .env
 
-# Generated while the app runs
 *.db
 *.png
 !docs/*.png

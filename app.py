@@ -3,6 +3,7 @@ from tools.dataset_tools import DatasetManager
 from agents.planner import Planner
 from agents.worker import Worker
 from core.entropy_logger import EntropyLogger  # Added
+from core.llm import get_client, get_model, MissingAPIKeyError
 import os
 import pandas as pd
 import sqlite3
@@ -10,6 +11,13 @@ import time  # Added for execution time tracking
 
 st.set_page_config(page_title="Data Science Assistant", layout="wide")
 st.title("Data Science Assistant")
+
+# Fail fast with a clear message instead of crashing on the first question
+try:
+    get_client()
+except MissingAPIKeyError as e:
+    st.error(f"🔑 {e}")
+    st.stop()
 
 # Initialize logger
 logger = EntropyLogger()
@@ -60,14 +68,9 @@ if dm.get_dataset() is not None:
 else:
     st.sidebar.info("No dataset loaded. Please load or upload a dataset.")
 
-# Display current mode
-st.sidebar.subheader("Current Mode")
-planning_mode = planner.get_planning_mode() if hasattr(planner, 'get_planning_mode') else "Unknown"
-st.sidebar.info(f"📋 Planning: {planning_mode}")
-
-if hasattr(worker, 'use_openai'):
-    code_gen_mode = "OpenAI" if worker.use_openai else "Qwen"
-    st.sidebar.info(f"💻 Code Generation: {code_gen_mode}")
+# Display which model is in use
+st.sidebar.subheader("Model")
+st.sidebar.info(f"🤖 {get_model()}")
 
 # Entropy Metrics in Sidebar
 st.sidebar.header("📈 Entropy Metrics")
@@ -209,14 +212,6 @@ with tab1:
                             else:
                                 st.error(f"❌ Error: {action_result.get('error', 'Unknown error')}")
                                 st.code(action_result.get("code", ""), language="python")
-
-                    # Refresh sidebar info
-                    planning_mode = planner.get_planning_mode() if hasattr(planner, 'get_planning_mode') else "Unknown"
-                    st.sidebar.info(f"📋 Planning: {planning_mode}")
-
-                    if hasattr(worker, 'use_openai'):
-                        code_gen_mode = "OpenAI" if worker.use_openai else "Qwen"
-                        st.sidebar.info(f"💻 Code Generation: {code_gen_mode}")
 
                 except Exception as e:
                     execution_time = time.time() - start_time  # Calculate execution time even for errors

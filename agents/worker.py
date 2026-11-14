@@ -1,8 +1,3 @@
-import os
-from openai import OpenAI
-from dotenv import load_dotenv
-from qwen_agent.agents import Assistant
-from qwen_agent.llm import get_chat_model
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,28 +10,13 @@ import warnings  # Added for warning handling
 
 # Import entropy logger + planner for feedback loop
 from core.entropy_logger import EntropyLogger
+from core.llm import chat
 from agents.planner import Planner
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class Worker:
     def __init__(self):
-        load_dotenv()
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_client = OpenAI(api_key=self.openai_api_key) if self.openai_api_key else None
-
-        # Initialize Qwen
-        llm_config = {
-            'model': 'qwen-turbo',
-            'model_server': 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-        }
-        llm = get_chat_model(llm_config)
-        self.qwen_agent = Assistant(llm=llm)
-
-        # Tools
-        self.use_openai = self.openai_api_key is not None
         self.logger = EntropyLogger()   # ✅ database logger
         self.planner = Planner()        # ✅ feedback planner
 
@@ -56,10 +36,7 @@ class Worker:
             while retries <= max_retries:
                 try:
                     # --- Generate code
-                    if self.use_openai:
-                        generated_code = self._generate_with_openai(action, args, df)
-                    else:
-                        generated_code = self._generate_with_qwen(action, args, df)
+                    generated_code = self._generate_code(action, args, df)
 
                     # --- Execute
                     result = self._execute_code(generated_code, df)
@@ -117,88 +94,18 @@ class Worker:
             logger.error(f"Feedback loop failed: {e}")
             return None    
     
-    def _generate_with_openai(self, action, args, df):
-        """Generate code using OpenAI"""
+    def _generate_code(self, action, args, df):
+        """Generate code with the LLM"""
         prompt = self._create_code_prompt(action, args, df)
-        
-        response = self.openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful code generation assistant. Return only executable Python code. Avoid pandas inplace operations with chained assignment as they cause warnings."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0
-        )
-        
-        code = response.choices[0].message.content.strip()
+
+        code = chat([
+            {"role": "system", "content": "You are a helpful code generation assistant. Return only executable Python code. Avoid pandas inplace operations with chained assignment as they cause warnings."},
+            {"role": "user", "content": prompt}
+        ]).strip()
         code = self._clean_code(code)
         code = self._validate_and_fix_code(code, df)
         return code
-    
-    def _generate_with_qwen(self, action, args, df):
-        """Generate code using Qwen"""
-        prompt = self._create_code_prompt(action, args, df)
-        
-        try:
-            # Get the response from Qwen agent
-            response = self.qwen_agent.run(prompt)
-            
-            # Handle different response types more robustly
-            content = self._extract_content_from_response(response)
-            
-            code = self._clean_code(content)
-            code = self._validate_and_fix_code(code, df)
-            return code
-            
-        except Exception as e:
-            logger.error(f"Qwen code generation failed: {e}")
-            # Fallback to simple code generation
-            return self._generate_fallback_code(action, args, df)
-    
-    def _extract_content_from_response(self, response):
-        """Extract content from various Qwen response formats"""
-        try:
-            # If response is a string, return it directly
-            if isinstance(response, str):
-                return response
-            
-            # If response has a content attribute
-            if hasattr(response, 'content'):
-                return response.content
-            
-            # If response is a dictionary with content
-            if isinstance(response, dict):
-                if 'content' in response:
-                    return response['content']
-                elif 'text' in response:
-                    return response['text']
-                elif 'response' in response:
-                    return response['response']
-            
-            # If response is iterable (like a generator)
-            if hasattr(response, '__iter__') and not isinstance(response, (str, dict)):
-                content = ""
-                for chunk in response:
-                    if hasattr(chunk, 'content'):
-                        content += str(chunk.content)
-                    elif isinstance(chunk, dict):
-                        if 'content' in chunk:
-                            content += str(chunk['content'])
-                        elif 'text' in chunk:
-                            content += str(chunk['text'])
-                    elif isinstance(chunk, str):
-                        content += chunk
-                    else:
-                        content += str(chunk)
-                return content
-            
-            # Fallback: convert to string
-            return str(response)
-            
-        except Exception as e:
-            logger.error(f"Error extracting content from response: {e}")
-            return f"# Error processing response: {str(e)}"
-    
+
     def _create_code_prompt(self, action, args, df):
         query = args.get('query', '')
         return f"""
@@ -241,115 +148,6 @@ class Worker:
         # Return cleaned dataframe
         result = df_clean
         """
-    
-    def _generate_fallback_code(self, action, args, df):
-        """Generate fallback code based on action type"""
-        action_lower = action.lower()
-        query = args.get('query', '').lower()
-        
-        if 'correlation' in query or 'relationship' in query:
-            return """
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-
-# Create copy to avoid warnings
-df_clean = df.copy()
-
-# Select only numeric columns for correlation
-numeric_df = df_clean.select_dtypes(include=[np.number])
-
-# Calculate correlation matrix
-correlation_matrix = numeric_df.corr()
-
-# Create heatmap
-plt.figure(figsize=(12, 8))
-sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0, fmt='.2f')
-plt.title('Correlation Matrix Heatmap')
-plt.tight_layout()
-plt.savefig('temp_plot.png', bbox_inches='tight', dpi=100)
-plt.close()
-
-# Return the correlation matrix
-result = correlation_matrix
-"""
-        elif 'clean' in query or 'missing' in query:
-            return """
-import pandas as pd
-import numpy as np
-
-# Create copy to avoid warnings
-df_clean = df.copy()
-
-# Handle missing values properly
-print("Missing values before cleaning:")
-print(df_clean.isnull().sum())
-
-# Fill numeric missing values with mean
-numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
-for col in numeric_cols:
-    df_clean[col] = df_clean[col].fillna(df_clean[col].mean())
-
-# Fill categorical missing values with mode
-categorical_cols = df_clean.select_dtypes(include=['object']).columns
-for col in categorical_cols:
-    df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0] if not df_clean[col].mode().empty else 'Unknown')
-
-print("\\nMissing values after cleaning:")
-print(df_clean.isnull().sum())
-
-result = df_clean
-"""
-        elif 'average' in query and ('class' in query or 'pclass' in query):
-            return """
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# Create copy to avoid warnings
-df_clean = df.copy()
-
-# Calculate average age by class
-average_age_by_class = df_clean.groupby('Pclass')['Age'].mean().reset_index()
-average_age_by_class.columns = ['Pclass', 'AverageAge']
-
-# Create a bar plot
-plt.figure(figsize=(10, 6))
-plt.bar(average_age_by_class['Pclass'].astype(str), average_age_by_class['AverageAge'])
-plt.xlabel('Passenger Class')
-plt.ylabel('Average Age')
-plt.title('Average Age by Passenger Class')
-plt.grid(True, alpha=0.3)
-
-# Add value labels on bars
-for i, v in enumerate(average_age_by_class['AverageAge']):
-    plt.text(i, v + 0.5, f'{v:.1f}', ha='center', va='bottom')
-
-plt.savefig('temp_plot.png', bbox_inches='tight', dpi=100)
-plt.close()
-
-# Return the result
-result = average_age_by_class
-"""
-        else:
-            return """
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# Create copy to avoid warnings
-df_clean = df.copy()
-
-# Basic data analysis
-print("Dataset shape:", df_clean.shape)
-print("\\nColumn names:", list(df_clean.columns))
-print("\\nData types:\\n", df_clean.dtypes)
-print("\\nMissing values:\\n", df_clean.isnull().sum())
-
-# Show basic statistics
-print("\\nBasic statistics:\\n", df_clean.describe())
-
-result = df_clean
-"""
     
     def _validate_and_fix_code(self, code, df):
         """Validate generated code and fix common pandas issues"""
