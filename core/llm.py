@@ -35,7 +35,7 @@ def get_client() -> OpenAI:
         )
     # The SDK already retries rate-limit and server errors (with back-off) twice.
     # Its default read timeout is 10 minutes, far too long for an interactive app.
-    return OpenAI(timeout=60, max_retries=2)
+    return OpenAI(timeout=float(os.getenv("LLM_TIMEOUT", "60")), max_retries=2)
 
 
 def chat(messages: list[dict], **kwargs) -> str:
