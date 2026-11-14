@@ -2,40 +2,64 @@ import streamlit as st
 from tools.dataset_tools import DatasetManager
 from agents.planner import Planner
 from agents.worker import Worker
-from core.entropy_logger import EntropyLogger  # Added
-import os
+from core.run_log import RunLog, run_status
+from core.llm import get_client, get_model, LLMUnavailable, MissingAPIKeyError
+from pathlib import Path
 import pandas as pd
-import sqlite3
-import time  # Added for execution time tracking
+import time
+
+# Paths are built from THIS file's location, so the app works no matter
+# which folder you start it from.
+BASE_DIR = Path(__file__).resolve().parent
+TITANIC_PATH = BASE_DIR / "datasets" / "Titanic-Dataset.csv"
 
 st.set_page_config(page_title="Data Science Assistant", layout="wide")
 st.title("Data Science Assistant")
 
-# Initialize logger
-logger = EntropyLogger()
+# Fail fast with a clear message instead of crashing on the first question
+try:
+    get_client()
+except MissingAPIKeyError as e:
+    st.error(f"🔑 {e}")
+    st.stop()
 
-# Initialize agents
-planner = Planner()
-worker = Worker()
+
+# Streamlit re-runs this whole script on EVERY click or keypress.
+# @st.cache_resource builds these objects once and reuses them on every rerun.
+@st.cache_resource
+def load_agents():
+    return Planner(), Worker(), RunLog()
+
+planner, worker, run_log = load_agents()
+
+
+def show_value(value):
+    """Display a step's `result` in the most readable form."""
+    if value is None:
+        return
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        st.dataframe(value)
+    elif type(value).__module__.startswith("matplotlib"):
+        return  # a chart object: the chart itself is already shown as an image
+    else:
+        st.write(value)
+
+# st.session_state survives reruns (per browser session), so the loaded
+# dataset is still there after the next click.
+if "dm" not in st.session_state:
+    st.session_state.dm = DatasetManager()
+dm = st.session_state.dm
 
 # Dataset management section
 st.sidebar.header("📁 Dataset Management")
-dm = DatasetManager()
 
 # Option 1: Load from predefined datasets
 st.sidebar.subheader("Load Example Dataset")
 if st.sidebar.button("Load Titanic Dataset"):
-    try:
-        if os.path.exists("datasets/titanic.csv"):
-            success = dm.load_from_path("titanic", "datasets/titanic.csv")
-            if success:
-                st.sidebar.success("✓ Titanic dataset loaded!")
-            else:
-                st.sidebar.error("Failed to load Titanic dataset")
-        else:
-            st.sidebar.warning("Titanic dataset file not found")
-    except Exception as e:
-        st.sidebar.error(f"Error loading Titanic dataset: {e}")
+    if not TITANIC_PATH.exists():
+        st.sidebar.error(f"Titanic dataset not found at {TITANIC_PATH}")
+    elif dm.load_from_path("titanic", TITANIC_PATH):
+        st.sidebar.success("✓ Titanic dataset loaded!")
 
 # Option 2: Upload custom dataset
 st.sidebar.subheader("Upload Your Dataset")
@@ -45,9 +69,11 @@ uploaded_file = st.sidebar.file_uploader(
     help="Upload a CSV file for analysis"
 )
 
-if uploaded_file is not None:
-    success = dm.load_from_upload(uploaded_file)
-    if success:
+# The uploader returns the same file on every rerun, so only load it when it is
+# a NEW upload. Otherwise it would silently replace a dataset chosen afterwards.
+if uploaded_file is not None and st.session_state.get("upload_id") != uploaded_file.file_id:
+    if dm.load_from_upload(uploaded_file):
+        st.session_state.upload_id = uploaded_file.file_id
         st.sidebar.success(f"✓ {uploaded_file.name} loaded successfully!")
 
 # Display dataset info
@@ -60,35 +86,9 @@ if dm.get_dataset() is not None:
 else:
     st.sidebar.info("No dataset loaded. Please load or upload a dataset.")
 
-# Display current mode
-st.sidebar.subheader("Current Mode")
-planning_mode = planner.get_planning_mode() if hasattr(planner, 'get_planning_mode') else "Unknown"
-st.sidebar.info(f"📋 Planning: {planning_mode}")
-
-if hasattr(worker, 'use_openai'):
-    code_gen_mode = "OpenAI" if worker.use_openai else "Qwen"
-    st.sidebar.info(f"💻 Code Generation: {code_gen_mode}")
-
-# Entropy Metrics in Sidebar
-st.sidebar.header("📈 Entropy Metrics")
-if st.sidebar.button("Show Entropy Report"):
-    try:
-        metrics = logger.get_entropy_metrics()
-        
-        if "error" in metrics:
-            st.sidebar.error(metrics["error"])
-        else:
-            st.sidebar.success("✅ Entropy Tracking Active")
-            
-            col1, col2 = st.sidebar.columns(2)
-            with col1:
-                st.metric("Total Queries", metrics['total_interactions'])
-                st.metric("Success Rate", f"{metrics['success_rate']*100:.1f}%")
-            with col2:
-                st.metric("Avg Time", f"{metrics['average_fix_time']:.2f}s")
-                st.metric("Total Errors", metrics['total_errors'])
-    except Exception as e:
-        st.sidebar.error(f"Could not load entropy metrics: {e}")
+# Display which model is in use
+st.sidebar.subheader("Model")
+st.sidebar.info(f"🤖 {get_model()}")
 
 # Instructions
 st.sidebar.header("ℹ️ Instructions")
@@ -110,7 +110,7 @@ st.sidebar.text("""
 """)
 
 # --- Tabs for navigation ---
-tab1, tab2 = st.tabs(["🔍 Data Analysis", "📊 Entropy Metrics"])
+tab1, tab2 = st.tabs(["🔍 Data Analysis", "📊 Run Metrics"])
 
 # ---------------------------
 # TAB 1: Data Analysis
@@ -134,189 +134,86 @@ with tab1:
             
             with st.spinner("Planning and executing..."):
                 try:
-                    # Create plan
-                    plan = planner.plan(user_query)
+                    # Create a validated plan (column names and types are sent, never rows)
+                    plan = planner.plan(user_query, dm.get_dataset())
 
-                    # Fallback for missing 'steps' with Worker-compatible dicts
-                    if 'steps' not in plan or not plan['steps']:
-                        st.warning(
-                            "Planner did not generate explicit steps. Using analysis and visualization sections as fallback."
-                        )
-                        pseudo_steps = []
-                        for a in plan.get('analysis', []):
-                            pseudo_steps.append({"action": a, "params": {}})
-                        for v in plan.get('visualization', []):
-                            pseudo_steps.append({"action": v, "params": {}})
-                        plan['steps'] = pseudo_steps
-
-                    # Critique plan (optional)
-                    if hasattr(planner, 'critique'):
-                        critique = planner.critique(plan)
-                        plan["self_check"] = critique
-
-                    st.subheader("📋 Analysis Plan (with Self-Critique):")
+                    st.subheader("📋 Analysis Plan")
+                    if plan.get("fallback_reason"):
+                        st.warning(f"The model's plan was unusable ({plan['fallback_reason']}), "
+                                   "so a simple rule-based plan is used instead.")
                     st.json(plan)
 
-                    # Execute plan safely
-                    result = worker.handle(plan, dm) if hasattr(worker, 'handle') else {}
+                    # Execute the plan, step by step
+                    result = worker.handle(plan, dm)
 
-                    execution_time = time.time() - start_time  # Calculate execution time
-                    
-                    # Log successful execution
-                    logger.log_interaction(
-                        prompt_text=user_query, 
-                        response_text="Analysis completed successfully", 
-                        error_count=0, 
-                        fix_time=execution_time
-                    )
+                    # Log what ACTUALLY happened (success / partial / failed), not just "no crash"
+                    run_log.record(user_query, get_model(), seconds=time.time() - start_time,
+                                   **run_status(result))
 
                     st.subheader("📈 Results:")
-
-                    # --- Display images safely ---
-                    for img_path in result.get("images", []):
-                        if os.path.exists(img_path):
-                            st.image(img_path)
+                    if result.get("stopped"):
+                        st.error(f"⛔ Stopped early: {result['stopped']}")
+                    for number, step in enumerate(result.get("steps", []), start=1):
+                        st.markdown(f"**Step {number} · `{step['action']}`** — {step['instruction']}")
+                        if step["skipped"]:
+                            st.info("Skipped because an earlier step did not complete.")
+                            continue
+                        repairs = len(step["failed_attempts"])
+                        if step["success"]:
+                            if repairs:
+                                st.caption(f"🔧 Self-repaired: {repairs} failed attempt(s) before the model's code worked "
+                                           "(details under 'Code and printed output').")
+                            for png in step["figures"]:
+                                st.image(png)
+                            show_value(step["result"])
                         else:
-                            st.warning(f"Image file not found: {img_path}")
+                            st.error(f"❌ {step['error']}")
+                        for warning in step["warnings"]:
+                            st.warning(f"⚠️ {warning}")
+                        if step["code"]:
+                            with st.expander("Code and printed output"):
+                                st.code(step["code"], language="python")
+                                if step["output"]:
+                                    st.text(step["output"])
+                                for i, failed in enumerate(step["failed_attempts"], start=1):
+                                    st.markdown(f"**Failed attempt {i}:** `{failed['error']}`")
+                                    st.code(failed["code"], language="python")
 
-                    # --- Display tables safely ---
-                    for i, table in enumerate(result.get("tables", [])):
-                        if isinstance(table, (pd.DataFrame, pd.Series)):
-                            st.dataframe(table)
-                        else:
-                            st.write(table)
-
-                    # --- Display execution details safely ---
-                    for action, action_result in result.get("results", {}).items():
-                        with st.expander(f"Action: {action}"):
-                            if action_result.get("success"):
-                                st.success("✅ Execution successful")
-
-                                if action_result.get("warnings"):
-                                    st.warning("⚠️ Warnings detected:")
-                                    for warning in action_result["warnings"]:
-                                        st.text(warning)
-
-                                if action_result.get("print_output"):
-                                    st.subheader("Console Output:")
-                                    for output in action_result["print_output"]:
-                                        st.text(output)
-
-                                if "output" in action_result:
-                                    st.write("Output:", action_result["output"])
-
-                                st.code(action_result.get("code", ""), language="python")
-                            else:
-                                st.error(f"❌ Error: {action_result.get('error', 'Unknown error')}")
-                                st.code(action_result.get("code", ""), language="python")
-
-                    # Refresh sidebar info
-                    planning_mode = planner.get_planning_mode() if hasattr(planner, 'get_planning_mode') else "Unknown"
-                    st.sidebar.info(f"📋 Planning: {planning_mode}")
-
-                    if hasattr(worker, 'use_openai'):
-                        code_gen_mode = "OpenAI" if worker.use_openai else "Qwen"
-                        st.sidebar.info(f"💻 Code Generation: {code_gen_mode}")
+                except LLMUnavailable as e:
+                    # The model provider could not answer (rate limit, overload, timeout, bad key...)
+                    run_log.record(user_query, get_model(), "provider_error", time.time() - start_time, error=str(e))
+                    st.error(f"🌐 {e}")
 
                 except Exception as e:
-                    execution_time = time.time() - start_time  # Calculate execution time even for errors
-                    
-                    # Log error with execution time
-                    logger.log_interaction(
-                        prompt_text=user_query, 
-                        response_text=f"Error: {str(e)}", 
-                        error_count=1, 
-                        fix_time=execution_time
-                    )
-                    
-                    st.error(f"Error during analysis: {str(e)}")
+                    run_log.record(user_query, get_model(), "error", time.time() - start_time, error=repr(e))
+                    st.error(f"Error during analysis: {e}")
 
 # ---------------------------
-# TAB 2: Entropy Metrics
+# TAB 2: Run Metrics
 # ---------------------------
 with tab2:
-    st.header("📊 Entropy Metrics Dashboard")
-
-    if os.path.exists("entropy_log.db"):
-        try:
-            # Use the logger's get_logs method which includes compatibility columns
-            df = logger.get_logs(limit=1000)  # Get all logs
-            
-            if not df.empty:
-                st.subheader("📈 System Performance Overview")
-                
-                # Key metrics in columns
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    total_interactions = len(df)
-                    st.metric("Total Interactions", total_interactions)
-                
-                with col2:
-                    success_rate = (df['error_count'] == 0).mean() * 100
-                    st.metric("Success Rate", f"{success_rate:.1f}%")
-                
-                with col3:
-                    avg_time = df['fix_time'].mean()
-                    st.metric("Avg Execution Time", f"{avg_time:.2f}s")
-                
-                with col4:
-                    total_errors = df['error_count'].sum()
-                    st.metric("Total Errors", total_errors)
-
-                st.subheader("📋 Recent Logs")
-                # Show most recent logs with important columns
-                display_columns = ['timestamp', 'prompt', 'error_count', 'fix_time', 'success']
-                available_columns = [col for col in display_columns if col in df.columns]
-                
-                if available_columns:
-                    st.dataframe(df[available_columns].head(10))
-                else:
-                    st.dataframe(df.head(10))
-
-                # Time series analysis
-                st.subheader("📊 Activity Over Time")
-                if 'timestamp' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    daily_activity = df.groupby(df['timestamp'].dt.date).size()
-                    st.line_chart(daily_activity)
-
-                # Error analysis
-                st.subheader("🔍 Error Analysis")
-                error_df = df[df['error_count'] > 0]
-                if not error_df.empty:
-                    st.write(f"**Error Patterns:** {len(error_df)} queries had errors")
-                    
-                    # Show error-prone queries
-                    if 'prompt' in error_df.columns:
-                        st.write("**Recent queries with errors:**")
-                        for _, row in error_df.head(5).iterrows():
-                            st.write(f"- {row['prompt'][:80]}... (Errors: {row['error_count']})")
-                else:
-                    st.success("🎉 No errors in the recorded logs!")
-                        
-            else:
-                st.info("No entropy data recorded yet. Start interacting with the assistant to create logs.")
-
-        except Exception as e:
-            st.error(f"Could not read entropy logs: {e}")
-            st.info("Trying alternative method...")
-            
-            # Fallback to direct SQLite access
-            try:
-                conn = sqlite3.connect("entropy_log.db")
-                df_raw = pd.read_sql_query("SELECT * FROM logs", conn)
-                conn.close()
-                
-                if not df_raw.empty:
-                    st.subheader("Raw Database Logs")
-                    st.dataframe(df_raw)
-                else:
-                    st.info("No data in entropy database.")
-                    
-            except Exception as sql_error:
-                st.error(f"Could not access database directly: {sql_error}")
-                
+    st.header("📊 Run Metrics")
+    st.caption("One row per question asked. Shows how often the assistant fully answers, "
+               "and how often self-repair rescues code that failed the first time.")
+    runs = run_log.load()
+    if runs.empty:
+        st.info("No runs recorded yet. Ask a question in the Data Analysis tab.")
     else:
-        st.info("Entropy log database not found. Start interacting with the assistant to create logs.")
-        st.info("The database will be created automatically when you run your first analysis.")
+        s = RunLog.summary(runs)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Questions", s["runs"])
+        c2.metric("Fully answered", f"{s['success_rate']:.0%}")
+        c3.metric("Median time", f"{s['median_seconds']:.1f}s")
+        c4.metric("Self-repair rescued",
+                  "n/a" if s["repair_success_rate"] is None else f"{s['repair_success_rate']:.0%}",
+                  help="Of the steps whose first code failed, the share the model then fixed.")
+        st.write(f"Partial or failed answers: **{s['partial_or_failed']}** · "
+                 f"Provider errors (rate limit, overload...): **{s['provider_errors']}**")
+
+        st.subheader("Outcomes")
+        st.bar_chart(runs["status"].value_counts())
+
+        st.subheader("Recent questions")
+        st.dataframe(runs[["timestamp", "question", "status", "steps_ok", "steps_total",
+                           "failed_attempts", "seconds", "model", "error"]].head(20),
+                     hide_index=True)

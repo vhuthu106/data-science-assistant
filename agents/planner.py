@@ -1,261 +1,127 @@
-import os
+"""Planner: turns a question about a dataset into a short, validated list of steps.
+
+A plan looks like:
+    {
+      "intent":   "average_age_by_class",
+      "question": "average age by passenger class",
+      "steps": [
+        {"action": "group_analysis", "args": {"query": "Compute the mean Age for each Pclass"}}
+      ]
+    }
+Each step's "query" is a specific instruction for that step, which the Worker turns into code.
+"""
 import json
-from dotenv import load_dotenv
-import requests
-from qwen_agent.agents import Assistant
-from qwen_agent.llm import get_chat_model
 import logging
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+from core.llm import chat
+
 logger = logging.getLogger(__name__)
 
+ALLOWED_ACTIONS = {
+    "data_analysis":        "summary statistics, counts, describing the data",
+    "data_cleaning":        "missing values, data types, duplicates",
+    "group_analysis":       "aggregates per category (mean, count, sum, ...)",
+    "correlation_analysis": "relationships between numeric columns",
+    "statistical_test":     "hypothesis tests (t-test, chi-square, ...)",
+    "create_plot":          "one chart",
+}
+MAX_STEPS = 3
+
+
+class PlanError(ValueError):
+    """The model's reply was not a usable plan."""
+
+
+def describe_dataset(df) -> str:
+    """Column names and types only. Rows are never sent to the model."""
+    if df is None:
+        return "No dataset details available."
+    cols = "\n".join(f"- {name}: {dtype}" for name, dtype in df.dtypes.astype(str).items())
+    return f"{df.shape[0]} rows x {df.shape[1]} columns\nColumns (name: type):\n{cols}"
+
+
+def extract_json(text: str) -> dict:
+    """Pull the JSON object out of a reply, even if it is wrapped in ``` fences or prose."""
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end < start:
+        raise PlanError("reply contains no JSON object")
+    return json.loads(text[start:end + 1])
+
+
+def validate_plan(raw, question: str) -> dict:
+    """Check the plan's shape and return a clean copy. Raises PlanError if unusable."""
+    if not isinstance(raw, dict):
+        raise PlanError("plan is not a JSON object")
+    steps = raw.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise PlanError("plan has no steps")
+    if len(steps) > MAX_STEPS:
+        logger.warning("Plan had %d steps; keeping the first %d", len(steps), MAX_STEPS)
+
+    clean_steps = []
+    for step in steps[:MAX_STEPS]:
+        if not isinstance(step, dict):
+            raise PlanError("a step is not an object")
+        action = step.get("action")
+        if action not in ALLOWED_ACTIONS:
+            raise PlanError(f"unknown action {action!r}")
+        args = step.get("args")
+        query = args.get("query") if isinstance(args, dict) else None
+        if not isinstance(query, str) or not query.strip():
+            raise PlanError(f"step {action!r} has no instruction")
+        clean_steps.append({"action": action, "args": {"query": query.strip()}})
+
+    return {"intent": str(raw.get("intent") or "analysis"), "question": question, "steps": clean_steps}
+
+
 class Planner:
-    def __init__(self):
-        load_dotenv()
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        
-        # Initialize Qwen as fallback
-        llm_config = {
-            'model': 'qwen-turbo',
-            'model_server': 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-        }
-        llm = get_chat_model(llm_config)
-        self.qwen_agent = Assistant(llm=llm)
-        
-        self.use_openai = True if self.openai_api_key else False
-        self.fallback_used = False
+    def plan(self, question: str, df=None) -> dict:
+        """Ask the LLM for a plan. If the reply is unusable, fall back to a rule-based plan.
 
-    def plan(self, user_query: str):
-        if self.use_openai:
-            try:
-                return self._plan_with_openai(user_query)
-            except Exception as e:
-                if any(error_str in str(e).lower() for error_str in ["quota", "429", "rate", "insufficient_quota", "expecting value"]):
-                    logger.warning(f"OpenAI failed ({e}). Switching to Qwen...")
-                    self.use_openai = False
-                    self.fallback_used = True
-                    return self._plan_with_qwen(user_query)
-                else:
-                    logger.error(f"OpenAI error: {e} for prompt ; {user_query}")
-                    raise e
-        else:
-            return self._plan_with_qwen(user_query)
-    
-    def _plan_with_openai(self, user_query: str):
-        """Use OpenAI for planning"""
-        if not self.openai_api_key:
-            logger.warning("OpenAI API key not found. Using Qwen instead.")
-            self.use_openai = False
-            return self._plan_with_qwen(user_query)
-            
-        prompt = f"""
-You are a planner agent for data science tasks. Convert the user request into a valid JSON plan with EXACTLY this structure:
-{{
-  "intent": "brief_description_of_the_task",
-  "steps": [
-    {{"action": "specific_action_name", "args": {{"query": "user_query_here"}}}}
-  ],
-  "analysis": ["steps for data prep or stats"],
-  "visualization": ["steps for plots"],
-  "validation": ["checks for correctness/errors"],
-  "tools": ["pandas", "matplotlib", "seaborn"]
-}}
+        Errors talking to the provider (timeouts, no credit, overloaded) are NOT caught here:
+        a fallback plan cannot help if the model is unreachable, so the caller shows the error.
+        """
+        actions = "\n".join(f"- {name}: {meaning}" for name, meaning in ALLOWED_ACTIONS.items())
+        prompt = f"""Plan how to answer a question about a pandas DataFrame.
 
-Available actions: create_plot, data_analysis, data_cleaning, correlation_analysis, group_analysis, statistical_test
+Dataset:
+{describe_dataset(df)}
 
-User request: "{user_query}"
+Question: "{question}"
 
-Return ONLY the JSON object without any additional text, explanations, or code blocks.
-"""
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.openai_api_key}"
-        }
-        
-        data = {
-            "model": "gpt-4.1-mini",
-            "messages": [
-                {"role": "system", "content": "You are a planning assistant that returns only valid JSON. No additional text."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0,
-            "max_tokens": 600
-        }
-        
+Break the question into 1-{MAX_STEPS} steps. Each step uses ONE action from this list:
+{actions}
+
+Each step's "query" must say specifically what that step should do, using only columns that exist.
+Reply with ONLY a JSON object in exactly this format:
+{{"intent": "short_snake_case_summary",
+ "steps": [{{"action": "group_analysis", "args": {{"query": "Compute the mean Age for each Pclass"}}}}]}}"""
+
+        reply = chat([
+            {"role": "system", "content": "You plan data analysis tasks. Reply with a single JSON object and nothing else."},
+            {"role": "user", "content": prompt},
+        ])
         try:
-            response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-
-            if response.status_code != 200:
-                raise Exception(f"API error: {response.status_code} - {response.text}")
-
-            result = response.json()
-            content = result['choices'][0]['message']['content'].strip()
-            content = self._clean_json_response(content)
-
-            if not content or content.isspace():
-                raise Exception("Empty response from OpenAI")
-
-            plan = json.loads(content)
-
-            # ✅ Ensure steps exist
-            if "steps" not in plan or not isinstance(plan["steps"], list) or len(plan["steps"]) == 0:
-                inferred_action = "data_analysis"
-                q = user_query.lower()
-                if any(x in q for x in ["plot", "chart", "visualize"]):
-                    inferred_action = "create_plot"
-                elif any(x in q for x in ["group", "average", "mean"]):
-                    inferred_action = "group_analysis"
-                elif any(x in q for x in ["correlation", "relationship"]):
-                    inferred_action = "correlation_analysis"
-                elif any(x in q for x in ["clean", "missing", "null"]):
-                    inferred_action = "data_cleaning"
-
-                plan["steps"] = [{"action": inferred_action, "args": {"query": user_query}}]
-                logger.info(f"✅ Auto-added steps to plan: {plan['steps']}")
-
+            return validate_plan(extract_json(reply), question)
+        except (json.JSONDecodeError, PlanError) as e:
+            logger.warning("Unusable plan from the model (%s). Using the rule-based plan.", e)
+            plan = self.rule_based_plan(question)
+            plan["fallback_reason"] = str(e)
             return plan
 
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}. Content: {content if 'content' in locals() else 'None'}")
-            return self._create_fallback_plan(user_query)
-        except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            raise e
-
-    def _clean_json_response(self, content):
-        """Clean the response to extract pure JSON"""
-        if not content:
-            return "{}"
-        
-        # Remove markdown code blocks
-        if '```json' in content:
-            content = content.split('```json')[1].split('```')[0].strip()
-        elif '```' in content:
-            content = content.split('```')[1].split('```')[0].strip()
-        
-        # Remove any non-JSON content before the first {
-        if '{' in content:
-            content = content[content.find('{'):]
-        
-        # Remove any non-JSON content after the last }
-        if '}' in content:
-            content = content[:content.rfind('}') + 1]
-        
-        return content
-    
-    def _plan_with_qwen(self, user_query: str):
-        """Use Qwen as fallback for planning"""
-        prompt = f"""
-You are a planner agent for data science tasks. Convert the user request into a valid JSON plan with EXACTLY this structure:
-{{
-  "intent": "brief_description",
-  "steps": [
-    {{"action": "specific_action_name", "args": {{"query": "user_query_here"}}}}
-  ],
-  "tools": ["pandas", "matplotlib", "seaborn"]
-}}
-
-Available actions: create_plot, data_analysis, data_cleaning, correlation_analysis, group_analysis, statistical_test
-
-User request: "{user_query}"
-
-Return ONLY the JSON object without any additional text or explanations.
-"""
-        
-        try:
-            response = self.qwen_agent.run(prompt)
-            
-            if hasattr(response, 'content'):
-                content = response.content
-            elif isinstance(response, dict) and 'content' in response:
-                content = response['content']
-            else:
-                content = str(response)
-            
-            content = self._clean_json_response(content)
-            
-            if not content or content.isspace():
-                return self._create_fallback_plan(user_query)
-                
-            return json.loads(content)
-            
-        except Exception as e:
-            logger.error(f"Qwen planning failed: {e}")
-            return self._create_fallback_plan(user_query)
-    
-    def _create_fallback_plan(self, user_query: str):
-        """Rule-based fallback planning"""
-        user_query_lower = user_query.lower()
-        
-        if any(word in user_query_lower for word in ['plot', 'chart', 'graph', 'visualize']):
-            return {
-                "intent": "data_visualization",
-                "steps": [{"action": "create_plot", "args": {"query": user_query}}],
-                "tools": ["matplotlib", "seaborn"]
-            }
-        elif any(word in user_query_lower for word in ['analyze', 'statistics', 'describe', 'summary']):
-            return {
-                "intent": "data_analysis",
-                "steps": [{"action": "data_analysis", "args": {"query": user_query}}],
-                "tools": ["pandas", "numpy"]
-            }
-        elif any(word in user_query_lower for word in ['clean', 'process', 'transform', 'filter']):
-            return {
-                "intent": "data_processing",
-                "steps": [{"action": "data_cleaning", "args": {"query": user_query}}],
-                "tools": ["pandas"]
-            }
-        elif any(word in user_query_lower for word in ['correlation', 'relationship']):
-            return {
-                "intent": "correlation_analysis",
-                "steps": [{"action": "correlation_analysis", "args": {"query": user_query}}],
-                "tools": ["pandas", "seaborn"]
-            }
-        elif any(word in user_query_lower for word in ['average', 'mean', 'group by']):
-            return {
-                "intent": "group_analysis",
-                "steps": [{"action": "group_analysis", "args": {"query": user_query}}],
-                "tools": ["pandas", "matplotlib"]
-            }
+    @staticmethod
+    def rule_based_plan(question: str) -> dict:
+        """Keyword-based single-step plan, used when the model's plan is unusable."""
+        q = question.lower()
+        if any(w in q for w in ["plot", "chart", "graph", "visualize", "histogram"]):
+            action = "create_plot"
+        elif any(w in q for w in ["correlation", "relationship"]):
+            action = "correlation_analysis"
+        elif any(w in q for w in ["clean", "missing", "null"]):
+            action = "data_cleaning"
+        elif any(w in q for w in ["average", "mean", "group by", " per ", " by "]):
+            action = "group_analysis"
         else:
-            return {
-                "intent": "general_analysis",
-                "steps": [{"action": "data_analysis", "args": {"query": user_query}}],
-                "tools": ["pandas", "matplotlib"]
-            }
-    
-    def get_planning_mode(self):
-        if self.use_openai:
-            return "OpenAI"
-        else:
-            return "Qwen (fallback)" if self.fallback_used else "Qwen"
-        
-    def critique(self, plan: dict):
-        """Ask the model to review its own plan and suggest improvements"""
-        critique_prompt = f"""
-You are a senior data science reviewer. Review the following plan for errors, missing steps, or unclear reasoning.
-Suggest improvements without changing the intent. Return JSON like:
-{{
-  "issues": ["list of problems"],
-  "improvements": ["suggested fixes"],
-  "confidence": "high/medium/low"
-}}
-
-Plan: {json.dumps(plan, indent=2)}
-"""
-        try:
-            if self.use_openai:
-                response = self._plan_with_openai(critique_prompt)
-            else:
-                response = self._plan_with_qwen(critique_prompt)
-            return response
-        except Exception as e:
-            logger.error(f"Critique failed: {e}")
-            return {"issues": ["Critique unavailable"], "improvements": [], "confidence": "low"}
+            action = "data_analysis"
+        return {"intent": action, "question": question,
+                "steps": [{"action": action, "args": {"query": question}}]}
