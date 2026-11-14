@@ -11,6 +11,7 @@ Configuration comes from environment variables (put them in a .env file):
 import os
 from functools import lru_cache
 
+import openai
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -21,6 +22,10 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 
 class MissingAPIKeyError(RuntimeError):
     """Raised when OPENAI_API_KEY is not configured."""
+
+
+class LLMUnavailable(RuntimeError):
+    """The model provider could not answer. The message is written for the user."""
 
 
 def get_model() -> str:
@@ -39,11 +44,43 @@ def get_client() -> OpenAI:
 
 
 def chat(messages: list[dict], **kwargs) -> str:
-    """Send a chat request and return the reply text."""
-    response = get_client().chat.completions.create(
-        model=get_model(),
-        messages=messages,
-        temperature=0,   # deterministic as possible: same question -> same plan/code
-        **kwargs,
-    )
+    """Send a chat request and return the reply text.
+
+    Raises LLMUnavailable (with a message for the user) if the provider can't answer.
+    """
+    try:
+        response = get_client().chat.completions.create(
+            model=get_model(),
+            messages=messages,
+            temperature=0,   # deterministic as possible: same question -> same plan/code
+            **kwargs,
+        )
+    except openai.APIError as e:
+        raise LLMUnavailable(explain_llm_error(e)) from e
     return response.choices[0].message.content or ""
+
+
+def explain_llm_error(e: Exception) -> str:
+    """Turn an SDK exception into a message a user can act on."""
+    model = get_model()
+    # Order matters: a timeout is a special kind of connection error in the SDK.
+    if isinstance(e, openai.APITimeoutError):
+        return f"The model ({model}) did not answer in time. Try again, switch OPENAI_MODEL, or raise LLM_TIMEOUT."
+    if isinstance(e, openai.APIConnectionError):
+        return "Could not reach the model provider. Check your internet connection and OPENAI_BASE_URL."
+    if isinstance(e, openai.AuthenticationError):
+        return "The API key was rejected. Check OPENAI_API_KEY in your .env file."
+    if isinstance(e, openai.RateLimitError):
+        text = str(e).lower()
+        if "quota" in text or "credit" in text:
+            return (f"Usage limit reached for {model} (quota or credit). If it is a per-minute limit, "
+                    "wait a minute; otherwise add credit, wait for the daily reset, or switch OPENAI_MODEL.")
+        return "Too many requests in a short time (rate limit). Wait a minute and try again."
+    if isinstance(e, openai.NotFoundError):
+        return f"The model '{model}' was not found. Check OPENAI_MODEL in your .env file."
+    if isinstance(e, openai.InternalServerError):
+        return (f"The model provider is overloaded or having problems (HTTP {getattr(e, 'status_code', '?')}). "
+                "Try again shortly or switch OPENAI_MODEL.")
+    if isinstance(e, openai.APIStatusError):
+        return f"The model provider returned an error (HTTP {getattr(e, 'status_code', '?')}): {e}"
+    return f"Unexpected error from the model provider: {e}"

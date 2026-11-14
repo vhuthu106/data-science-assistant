@@ -4,12 +4,13 @@ import re
 
 from core.entropy_logger import EntropyLogger
 from core.executor import new_namespace, run_code, snapshot, user_variables
-from core.llm import chat
-from agents.planner import Planner, describe_dataset
+from core.llm import LLMUnavailable, chat
+from agents.planner import describe_dataset
 
 logger = logging.getLogger(__name__)
 
 CODE_BLOCK = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
+MAX_REPAIRS = 2   # after the first attempt, how many times the model may fix its own code
 
 
 def extract_code(reply: str) -> str:
@@ -21,60 +22,81 @@ def extract_code(reply: str) -> str:
 class Worker:
     def __init__(self):
         self.logger = EntropyLogger()   # ✅ database logger
-        self.planner = Planner()        # ✅ feedback planner
 
-    def handle(self, plan, dataset_manager, max_retries=2):
+    def handle(self, plan, dataset_manager):
+        """Run every step of the plan in order, sharing one namespace.
+
+        Stops early (marking the remaining steps as skipped) if a step still fails after
+        its repairs, or if the model provider can't be reached. Finished steps are kept.
+        """
         df = dataset_manager.get_dataset()
         if df is None:
             return {"error": "No dataset loaded", "steps": []}
 
         question = plan.get("question", "")
         namespace = new_namespace(df)          # shared by ALL steps of this plan
-        outputs = {"steps": []}
+        outputs = {"steps": [], "stopped": None}
 
-        for step in plan["steps"]:
+        for index, step in enumerate(plan["steps"]):
             action = step["action"]
             instruction = step.get("args", {}).get("query", "")
-            retries = 0
+            try:
+                record = self._run_step(question, action, instruction, namespace)
+            except LLMUnavailable as e:
+                outputs["stopped"] = str(e)
+                outputs["steps"].append(self._not_run(action, instruction, error=str(e)))
+            else:
+                outputs["steps"].append(record)
+                if not record["success"]:
+                    outputs["stopped"] = f"Step {index + 1} failed after {len(record['failed_attempts'])} attempts."
 
-            while True:
-                code = self._generate_code(question, action, instruction, namespace)
-                trial = snapshot(namespace)
-                result = run_code(code, trial)
-
-                if result.success:
-                    namespace.clear()
-                    namespace.update(trial)    # keep this step's changes for later steps
-                    break
-
-                retries += 1
-                if retries > max_retries:
-                    break
-                # 🔄 Ask planner to revise plan  (replaced in Step 6)
-                revised_plan = self._feedback_to_planner(plan, action, result.error)
-                if revised_plan:
-                    step = revised_plan["steps"][0]
-                    action = step["action"]
-                    instruction = step.get("args", {}).get("query", "")
-
-            outputs["steps"].append({"action": action, "instruction": instruction, **vars(result)})
+            if outputs["stopped"]:
+                for later in plan["steps"][index + 1:]:
+                    outputs["steps"].append(self._not_run(later["action"], later.get("args", {}).get("query", ""),
+                                                          skipped=True))
+                break
 
         return outputs
 
-    def _feedback_to_planner(self, plan, action, error_msg):
-        """Ask planner to fix the plan if worker execution failed"""
-        try:
-            revised = self.planner.plan(f"Revise due to error: {error_msg}")
-            return revised
-        except Exception as e:
-            logger.error(f"Feedback loop failed: {e}")
-            return None
+    def _run_step(self, question, action, instruction, namespace):
+        """Generate code, run it, and if it fails let the model repair it using the error."""
+        messages = [
+            {"role": "system", "content": "You write short, correct pandas code. Reply with code only."},
+            {"role": "user", "content": self._code_prompt(question, action, instruction, namespace)},
+        ]
+        failed_attempts = []
+        for attempt in range(1 + MAX_REPAIRS):
+            code = extract_code(chat(messages))
+            trial = snapshot(namespace)
+            result = run_code(code, trial)
+            if result.success:
+                namespace.clear()
+                namespace.update(trial)        # keep this step's changes for later steps
+                break
+            failed_attempts.append({"code": code, "error": result.error})
+            logger.info("Step %r attempt %d failed: %s", action, attempt + 1, result.error)
+            # Show the model its own code and the exact error, and ask for a fix.
+            printed = f"\nPrinted output before the error:\n{result.output[-1000:]}" if result.output else ""
+            messages += [
+                {"role": "assistant", "content": f"```python\n{code}\n```"},
+                {"role": "user", "content": f"That code failed with this error:\n{result.error}{printed}\n\n"
+                                            "Fix the problem. Reply with the complete corrected code only."},
+            ]
+        return {"action": action, "instruction": instruction, "failed_attempts": failed_attempts,
+                "skipped": False, **vars(result)}
 
-    def _generate_code(self, question, action, instruction, namespace):
-        """Ask the LLM for code that performs one step."""
+    @staticmethod
+    def _not_run(action, instruction, error=None, skipped=False):
+        """Record for a step that produced no code result (provider error, or skipped)."""
+        return {"action": action, "instruction": instruction, "success": False, "skipped": skipped,
+                "error": error, "code": "", "output": "", "warnings": [], "figures": [],
+                "result": None, "failed_attempts": []}
+
+    def _code_prompt(self, question, action, instruction, namespace):
+        """The instructions for writing one step's code."""
         earlier = user_variables(namespace)
         earlier_text = ", ".join(f"{n} ({t})" for n, t in earlier.items()) or "none"
-        prompt = f"""Write Python code for one step of a data analysis.
+        return f"""Write Python code for one step of a data analysis.
 
 Overall question: {question}
 This step ({action}): {instruction}
@@ -95,8 +117,3 @@ Rules:
 5. Use only columns that exist.
 
 Reply with only the code."""
-        reply = chat([
-            {"role": "system", "content": "You write short, correct pandas code. Reply with code only."},
-            {"role": "user", "content": prompt},
-        ])
-        return extract_code(reply)

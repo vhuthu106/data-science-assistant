@@ -3,7 +3,7 @@ from tools.dataset_tools import DatasetManager
 from agents.planner import Planner
 from agents.worker import Worker
 from core.entropy_logger import EntropyLogger  # Added
-from core.llm import get_client, get_model, MissingAPIKeyError
+from core.llm import get_client, get_model, LLMUnavailable, MissingAPIKeyError
 import os
 from pathlib import Path
 import pandas as pd
@@ -180,9 +180,18 @@ with tab1:
                     )
 
                     st.subheader("📈 Results:")
+                    if result.get("stopped"):
+                        st.error(f"⛔ Stopped early: {result['stopped']}")
                     for number, step in enumerate(result.get("steps", []), start=1):
                         st.markdown(f"**Step {number} · `{step['action']}`** — {step['instruction']}")
+                        if step["skipped"]:
+                            st.info("Skipped because an earlier step did not complete.")
+                            continue
+                        repairs = len(step["failed_attempts"])
                         if step["success"]:
+                            if repairs:
+                                st.caption(f"🔧 Self-repaired: {repairs} failed attempt(s) before the model's code worked "
+                                           "(details under 'Code and printed output').")
                             for png in step["figures"]:
                                 st.image(png)
                             show_value(step["result"])
@@ -190,10 +199,20 @@ with tab1:
                             st.error(f"❌ {step['error']}")
                         for warning in step["warnings"]:
                             st.warning(f"⚠️ {warning}")
-                        with st.expander("Code and printed output"):
-                            st.code(step["code"], language="python")
-                            if step["output"]:
-                                st.text(step["output"])
+                        if step["code"]:
+                            with st.expander("Code and printed output"):
+                                st.code(step["code"], language="python")
+                                if step["output"]:
+                                    st.text(step["output"])
+                                for i, failed in enumerate(step["failed_attempts"], start=1):
+                                    st.markdown(f"**Failed attempt {i}:** `{failed['error']}`")
+                                    st.code(failed["code"], language="python")
+
+                except LLMUnavailable as e:
+                    # The model provider could not answer (rate limit, overload, timeout, bad key...)
+                    logger.log_interaction(prompt_text=user_query, response_text=f"Provider error: {e}",
+                                           error_count=1, fix_time=time.time() - start_time)
+                    st.error(f"🌐 {e}")
 
                 except Exception as e:
                     execution_time = time.time() - start_time  # Calculate execution time even for errors
