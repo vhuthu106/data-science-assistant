@@ -3,6 +3,7 @@
 One row per question, in a small SQLite database next to the code (runs.db).
 """
 import datetime
+import os
 import sqlite3
 from pathlib import Path
 
@@ -52,8 +53,9 @@ def run_status(result: dict) -> dict:
 
 
 class RunLog:
-    def __init__(self, db_path=DEFAULT_DB):
-        self.db_path = str(db_path)
+    def __init__(self, db_path=None):
+        # RUNS_DB lets tests (or a deployment) use a different database file.
+        self.db_path = str(db_path or os.getenv("RUNS_DB") or DEFAULT_DB)
         self._execute(f"CREATE TABLE IF NOT EXISTS runs ({COLUMNS})")
 
     def _execute(self, sql, params=()):
