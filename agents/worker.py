@@ -2,7 +2,6 @@
 import logging
 import re
 
-from core.entropy_logger import EntropyLogger
 from core.executor import new_namespace, run_code, snapshot, user_variables
 from core.llm import LLMUnavailable, chat
 from core.safety import ALLOWED_MODULES
@@ -21,9 +20,6 @@ def extract_code(reply: str) -> str:
 
 
 class Worker:
-    def __init__(self):
-        self.logger = EntropyLogger()   # ✅ database logger
-
     def handle(self, plan, dataset_manager):
         """Run every step of the plan in order, sharing one namespace.
 
