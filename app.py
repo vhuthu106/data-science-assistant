@@ -5,9 +5,15 @@ from agents.worker import Worker
 from core.entropy_logger import EntropyLogger  # Added
 from core.llm import get_client, get_model, MissingAPIKeyError
 import os
+from pathlib import Path
 import pandas as pd
 import sqlite3
 import time  # Added for execution time tracking
+
+# Paths are built from THIS file's location, so the app works no matter
+# which folder you start it from.
+BASE_DIR = Path(__file__).resolve().parent
+TITANIC_PATH = BASE_DIR / "datasets" / "Titanic-Dataset.csv"
 
 st.set_page_config(page_title="Data Science Assistant", layout="wide")
 st.title("Data Science Assistant")
@@ -19,31 +25,31 @@ except MissingAPIKeyError as e:
     st.error(f"🔑 {e}")
     st.stop()
 
-# Initialize logger
-logger = EntropyLogger()
 
-# Initialize agents
-planner = Planner()
-worker = Worker()
+# Streamlit re-runs this whole script on EVERY click or keypress.
+# @st.cache_resource builds these objects once and reuses them on every rerun.
+@st.cache_resource
+def load_agents():
+    return Planner(), Worker(), EntropyLogger()
+
+planner, worker, logger = load_agents()
+
+# st.session_state survives reruns (per browser session), so the loaded
+# dataset is still there after the next click.
+if "dm" not in st.session_state:
+    st.session_state.dm = DatasetManager()
+dm = st.session_state.dm
 
 # Dataset management section
 st.sidebar.header("📁 Dataset Management")
-dm = DatasetManager()
 
 # Option 1: Load from predefined datasets
 st.sidebar.subheader("Load Example Dataset")
 if st.sidebar.button("Load Titanic Dataset"):
-    try:
-        if os.path.exists("datasets/titanic.csv"):
-            success = dm.load_from_path("titanic", "datasets/titanic.csv")
-            if success:
-                st.sidebar.success("✓ Titanic dataset loaded!")
-            else:
-                st.sidebar.error("Failed to load Titanic dataset")
-        else:
-            st.sidebar.warning("Titanic dataset file not found")
-    except Exception as e:
-        st.sidebar.error(f"Error loading Titanic dataset: {e}")
+    if not TITANIC_PATH.exists():
+        st.sidebar.error(f"Titanic dataset not found at {TITANIC_PATH}")
+    elif dm.load_from_path("titanic", TITANIC_PATH):
+        st.sidebar.success("✓ Titanic dataset loaded!")
 
 # Option 2: Upload custom dataset
 st.sidebar.subheader("Upload Your Dataset")
@@ -53,9 +59,11 @@ uploaded_file = st.sidebar.file_uploader(
     help="Upload a CSV file for analysis"
 )
 
-if uploaded_file is not None:
-    success = dm.load_from_upload(uploaded_file)
-    if success:
+# The uploader returns the same file on every rerun, so only load it when it is
+# a NEW upload. Otherwise it would silently replace a dataset chosen afterwards.
+if uploaded_file is not None and st.session_state.get("upload_id") != uploaded_file.file_id:
+    if dm.load_from_upload(uploaded_file):
+        st.session_state.upload_id = uploaded_file.file_id
         st.sidebar.success(f"✓ {uploaded_file.name} loaded successfully!")
 
 # Display dataset info
