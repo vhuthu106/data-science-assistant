@@ -34,6 +34,18 @@ def load_agents():
 
 planner, worker, logger = load_agents()
 
+
+def show_value(value):
+    """Display a step's `result` in the most readable form."""
+    if value is None:
+        return
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        st.dataframe(value)
+    elif type(value).__module__.startswith("matplotlib"):
+        return  # a chart object: the chart itself is already shown as an image
+    else:
+        st.write(value)
+
 # st.session_state survives reruns (per browser session), so the loaded
 # dataset is still there after the next click.
 if "dm" not in st.session_state:
@@ -154,8 +166,8 @@ with tab1:
                                    "so a simple rule-based plan is used instead.")
                     st.json(plan)
 
-                    # Execute plan safely
-                    result = worker.handle(plan, dm) if hasattr(worker, 'handle') else {}
+                    # Execute the plan, step by step
+                    result = worker.handle(plan, dm)
 
                     execution_time = time.time() - start_time  # Calculate execution time
                     
@@ -168,44 +180,20 @@ with tab1:
                     )
 
                     st.subheader("📈 Results:")
-
-                    # --- Display images safely ---
-                    for img_path in result.get("images", []):
-                        if os.path.exists(img_path):
-                            st.image(img_path)
+                    for number, step in enumerate(result.get("steps", []), start=1):
+                        st.markdown(f"**Step {number} · `{step['action']}`** — {step['instruction']}")
+                        if step["success"]:
+                            for png in step["figures"]:
+                                st.image(png)
+                            show_value(step["result"])
                         else:
-                            st.warning(f"Image file not found: {img_path}")
-
-                    # --- Display tables safely ---
-                    for i, table in enumerate(result.get("tables", [])):
-                        if isinstance(table, (pd.DataFrame, pd.Series)):
-                            st.dataframe(table)
-                        else:
-                            st.write(table)
-
-                    # --- Display execution details safely ---
-                    for action, action_result in result.get("results", {}).items():
-                        with st.expander(f"Action: {action}"):
-                            if action_result.get("success"):
-                                st.success("✅ Execution successful")
-
-                                if action_result.get("warnings"):
-                                    st.warning("⚠️ Warnings detected:")
-                                    for warning in action_result["warnings"]:
-                                        st.text(warning)
-
-                                if action_result.get("print_output"):
-                                    st.subheader("Console Output:")
-                                    for output in action_result["print_output"]:
-                                        st.text(output)
-
-                                if "output" in action_result:
-                                    st.write("Output:", action_result["output"])
-
-                                st.code(action_result.get("code", ""), language="python")
-                            else:
-                                st.error(f"❌ Error: {action_result.get('error', 'Unknown error')}")
-                                st.code(action_result.get("code", ""), language="python")
+                            st.error(f"❌ {step['error']}")
+                        for warning in step["warnings"]:
+                            st.warning(f"⚠️ {warning}")
+                        with st.expander("Code and printed output"):
+                            st.code(step["code"], language="python")
+                            if step["output"]:
+                                st.text(step["output"])
 
                 except Exception as e:
                     execution_time = time.time() - start_time  # Calculate execution time even for errors
